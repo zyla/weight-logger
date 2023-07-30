@@ -1,8 +1,9 @@
+use esp_idf_hal::adc::{self, AdcChannelDriver, AdcConfig, AdcDriver, Atten11dB, ADC1};
 use esp_idf_hal::gpio::PinDriver;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use embedded_svc::mqtt::client::{Publish, QoS};
+use embedded_svc::mqtt::client::QoS;
 use embedded_svc::wifi::{AuthMethod, ClientConfiguration, Configuration};
 use esp_idf_hal::delay::Delay;
 use esp_idf_hal::prelude::*;
@@ -42,6 +43,16 @@ fn real_main() -> anyhow::Result<()> {
 
     let peripherals = Peripherals::take().unwrap();
 
+    let mut adc1 = AdcDriver::new(
+        peripherals.adc1,
+        &AdcConfig::new()
+            .calibration(true)
+            .resolution(adc::config::Resolution::Resolution12Bit),
+    )?;
+    let mut vcc_adc_channel = AdcChannelDriver::<_, Atten11dB<ADC1>>::new(peripherals.pins.gpio36)?;
+    let mut vbat_adc_channel =
+        AdcChannelDriver::<_, Atten11dB<ADC1>>::new(peripherals.pins.gpio33)?;
+
     let dout = PinDriver::input(peripherals.pins.gpio19)?;
     let pd_sck = PinDriver::output(peripherals.pins.gpio23)?;
     let mut hx711 =
@@ -66,19 +77,90 @@ fn real_main() -> anyhow::Result<()> {
     let mut mqtt_client =
         EspMqttClient::new(broker_url, &MqttClientConfiguration::default(), |_| {})?;
 
-    let topic = "waga1";
-
     loop {
-        let reading = block!(hx711.retrieve()).map_err(|_| anyhow!("can't read from HX711"))?;
-        let value = (reading + 403300) / 20;
-        println!("Weight: {}g", value);
-        mqtt_client.publish(
-            topic,
+        let mut acc_vcc: u32 = 0;
+        let mut acc_vbat: u32 = 0;
+        let mut acc_value = 0;
+        let mut acc_chb = 0;
+        const N: u32 = 10;
+
+        hx711.enable().map_err(|_| anyhow!("can't enable HX711"))?;
+
+        for _ in 0..N {
+            acc_vcc += adc1.read(&mut vcc_adc_channel)? as u32 * 2;
+            acc_vbat += adc1.read(&mut vbat_adc_channel)? as u32 * 2;
+            block!(hx711.set_mode(hx711::Mode::ChAGain128))
+                .map_err(|_| anyhow!("can't set HX711 mode"))?;
+            acc_value += block!(hx711.retrieve()).map_err(|_| anyhow!("can't read from HX711"))?;
+            block!(hx711.set_mode(hx711::Mode::ChBGain32))
+                .map_err(|_| anyhow!("can't set HX711 mode"))?;
+            acc_chb += block!(hx711.retrieve()).map_err(|_| anyhow!("can't read from HX711"))?;
+
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+        hx711
+            .disable()
+            .map_err(|_| anyhow!("can't disable HX711"))?;
+
+        let vcc = acc_vcc / N;
+        let vbat = acc_vbat / N;
+        let value = acc_value / (N as i32);
+        let chb = acc_chb / (N as i32);
+
+        println!("VCC: {}mV", vcc);
+        match mqtt_client.enqueue(
+            "waga1/vcc",
             QoS::AtLeastOnce,
-            false,
+            true,
+            format!("{vcc}").as_bytes(),
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                error!("publish failed: {e}");
+            }
+        }
+
+        println!("VBAT: {}mV", vbat);
+        match mqtt_client.enqueue(
+            "waga1/vbat",
+            QoS::AtLeastOnce,
+            true,
+            format!("{vbat}").as_bytes(),
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                error!("publish failed: {e}");
+            }
+        }
+
+        println!("Value: {}", value);
+        match mqtt_client.enqueue(
+            "waga1/value",
+            QoS::AtLeastOnce,
+            true,
             format!("{value}").as_bytes(),
-        );
-        std::thread::sleep(Duration::from_secs(1));
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                error!("publish failed: {e}");
+            }
+        }
+
+        println!("Channel B: {}", chb);
+        match mqtt_client.enqueue(
+            "waga1/chb",
+            QoS::AtLeastOnce,
+            true,
+            format!("{chb}").as_bytes(),
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                error!("publish failed: {e}");
+            }
+        }
+
+        std::thread::sleep(Duration::from_secs(10));
     }
 }
 
