@@ -82,7 +82,7 @@ fn real_main() -> anyhow::Result<()> {
         let mut acc_vbat: u32 = 0;
         let mut acc_value = 0;
         let mut acc_chb = 0;
-        const N: u32 = 10;
+        const N: u32 = 1;
 
         hx711.enable().map_err(|_| anyhow!("can't enable HX711"))?;
 
@@ -160,7 +160,7 @@ fn real_main() -> anyhow::Result<()> {
             }
         }
 
-        std::thread::sleep(Duration::from_secs(10));
+        // std::thread::sleep(Duration::from_secs(10));
     }
 }
 
